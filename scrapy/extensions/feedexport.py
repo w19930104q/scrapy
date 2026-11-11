@@ -254,25 +254,68 @@ class FileFeedStorage:
 
     *uri* may be a ``file://`` URI or a plain path. Missing parent directories
     are created when the feed is opened.
+
+    When the *atomic* :ref:`feed option <feed-options>` is enabled, each batch
+    is written to a temporary file in the target directory and the target is
+    replaced with it atomically when the batch is stored.
     """
 
     supported_modes: frozenset[str] = _FEED_MODES
 
     def __init__(self, uri: str, *, feed_options: dict[str, Any] | None = None):
+        feed_options = feed_options or {}
         self.path: str = file_uri_to_path(uri) if uri.startswith("file:") else uri
         self.write_mode: OpenBinaryMode = _WRITE_MODES[
             _get_mode(self, feed_options, "append")
         ]
+        self.atomic: bool = bool(feed_options.get("atomic"))
+        self._tmp_file: IO[bytes] | None = None
+        self._tmp_path: str | None = None
 
     def open(self, spider: Spider) -> IO[bytes]:
         dirname = Path(self.path).parent
         if dirname and not dirname.exists():
             dirname.mkdir(parents=True)
-        return Path(self.path).open(self.write_mode)
+        if not self.atomic:
+            return Path(self.path).open(self.write_mode)
+        # The temporary file is created in the target directory, so that the
+        # replacement in store() is atomic, and does not delete itself when
+        # closed, so that it survives until it is either stored or discarded.
+        tmp_file = NamedTemporaryFile(
+            prefix=f".{Path(self.path).name}-", dir=dirname, delete=False
+        )
+        self._tmp_file = tmp_file
+        self._tmp_path = tmp_file.name
+        return tmp_file
 
     def store(self, file: IO[bytes]) -> Deferred[None] | None:
         file.close()
+        if not self.atomic:
+            return None
+        tmp_path = self._tmp_path
+        self._tmp_file = None
+        self._tmp_path = None
+        assert tmp_path is not None
+        try:
+            Path(tmp_path).replace(self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                Path(tmp_path).unlink()
+            raise
         return None
+
+    def _discard(self) -> None:
+        """Close and remove the temporary file of a batch that will not be
+        stored."""
+        tmp_file, tmp_path = self._tmp_file, self._tmp_path
+        self._tmp_file = None
+        self._tmp_path = None
+        if tmp_file is None or tmp_path is None:
+            return
+        if not tmp_file.closed:
+            tmp_file.close()
+        with contextlib.suppress(OSError):
+            Path(tmp_path).unlink()
 
 
 class S3FeedStorage(BlockingFeedStorage):
@@ -664,6 +707,17 @@ class FeedSlot:
             await _maybe_coroutine(self.exporter.finish_exporting)
             self._exporting = False
 
+    def _discard(self) -> None:
+        """Close the output of this slot without storing it, removing the
+        temporary file of an atomic feed."""
+        if self.file is not None:
+            # Closing a PostProcessingManager flushes its plugins but leaves
+            # the underlying file open, so the storage is told to discard it.
+            with contextlib.suppress(Exception):
+                self.file.close()
+        if isinstance(self.storage, FileFeedStorage):
+            self.storage._discard()
+
 
 class FeedExporter:
     @classmethod
@@ -684,6 +738,9 @@ class FeedExporter:
         self.slots: list[FeedSlot] = []
         self.filters: dict[str, ItemFilter] = {}
         self.processors: dict[str, _ItemProcessor | None] = {}
+        # Feed URIs whose batch could not be stored. The remaining batches of
+        # those feeds are discarded, so that a feed never contains a gap.
+        self._failed_feeds: set[str] = set()
         self._pending_close_tasks: list[asyncio.Task[None] | Deferred[None]] = []
         # Item export may await user-defined code (e.g. an async def
         # export_item() method), while item_scraped signals are sent
@@ -750,6 +807,7 @@ class FeedExporter:
         for uri, feed_options in self.feeds.items():
             if not self._storage_supported(uri, feed_options):
                 raise NotConfigured
+            self._check_atomic(uri, feed_options)
             if not self._settings_are_valid():
                 raise NotConfigured
             if not self._exporter_supported(feed_options["format"]):
@@ -892,19 +950,51 @@ class FeedExporter:
         if slot._skipped:
             return
 
-        if slot.itemcount:
-            # Normal case
-            await slot.finish_exporting()
-        elif slot.store_empty and slot.batch_id == 1:
-            # Need to store the empty file
-            await slot.start_exporting()
-            await slot.finish_exporting()
-        else:
-            # In this case, the file is not stored, so no processing is required.
-            return
-
+        atomic = bool(slot.feed_options.get("atomic"))
         logmsg = f"{slot.format} feed ({slot.itemcount} items) in: {slot.uri}"
         slot_type = type(slot.storage).__name__
+        try:
+            if slot.itemcount:
+                # Normal case
+                await slot.finish_exporting()
+            elif slot.store_empty and slot.batch_id == 1:
+                # Need to store the empty file
+                await slot.start_exporting()
+                await slot.finish_exporting()
+            else:
+                # In this case, the file is not stored, so no processing is
+                # required.
+                return
+        except Exception:
+            if not atomic:
+                raise
+            logger.exception(
+                "Error finishing %s",
+                logmsg,
+                extra={"spider": spider},
+            )
+            self._fail_atomic_slot(slot)
+        else:
+            await self._store_slot(slot, spider, logmsg, slot_type)
+        await self.crawler.signals.send_catch_log_async(
+            signals.feed_slot_closed, slot=slot
+        )
+
+    async def _store_slot(
+        self, slot: FeedSlot, spider: Spider, logmsg: str, slot_type: str
+    ) -> None:
+        atomic = bool(slot.feed_options.get("atomic"))
+        if atomic and slot.uri_template in self._failed_feeds:
+            # A batch of this feed failed to be stored. Storing this batch too
+            # would leave a gap in the feed.
+            logger.info(
+                "Discarding %s because a batch of its feed failed",
+                logmsg,
+                extra={"spider": spider},
+            )
+            slot._discard()
+            return
+
         self.crawler.stats.inc_value(
             f"feedexport/item_count/{slot_type}", slot.itemcount
         )
@@ -912,20 +1002,31 @@ class FeedExporter:
             await ensure_awaitable(slot.storage.store(self._get_file(slot)))
         except FileExistsError:
             self._skip(slot)
-            self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+            if atomic:
+                self._fail_atomic_slot(slot)
+            else:
+                self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
         except Exception:
             logger.exception(
                 "Error storing %s",
                 logmsg,
                 extra={"spider": spider},
             )
-            self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+            if atomic:
+                self._fail_atomic_slot(slot)
+            else:
+                self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
         else:
             logger.info("Stored %s", logmsg, extra={"spider": spider})
             self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
 
-        await self.crawler.signals.send_catch_log_async(
-            signals.feed_slot_closed, slot=slot
+    def _fail_atomic_slot(self, slot: FeedSlot) -> None:
+        """Discard the batch of *slot*, which could not be stored, and mark its
+        feed as failed so that its remaining batches are discarded."""
+        slot._discard()
+        self._failed_feeds.add(slot.uri_template)
+        self.crawler.stats.inc_value(
+            f"feedexport/failed_count/{type(slot.storage).__name__}"
         )
 
     def _start_new_batch(
@@ -946,7 +1047,7 @@ class FeedExporter:
         :param uri_template: template of uri which contains %(batch_time)s or %(batch_id)d to create new uri
         """
         storage = self._get_storage(uri, feed_options)
-        return FeedSlot(
+        slot = FeedSlot(
             storage=storage,
             uri=uri,
             format=feed_options["format"],
@@ -960,6 +1061,12 @@ class FeedExporter:
             settings=self.settings,
             crawler=self.crawler,
         )
+        if feed_options.get("atomic") and uri_template in self._failed_feeds:
+            # A batch of this feed failed to be stored. Its items are still
+            # counted, so that the batches of other feeds keep covering the
+            # same items, but the batch itself is not written.
+            slot._skipped = True
+        return slot
 
     async def item_scraped(self, item: Any, spider: Spider) -> None:
         if not self._export_lock.locked:
@@ -982,17 +1089,26 @@ class FeedExporter:
                 continue
 
             processor = self.processors[slot.uri_template]
+            atomic = bool(slot.feed_options.get("atomic"))
             for exported_item in processor(item) if processor else (item,):
                 if not slot._skipped:
                     try:
                         await slot.start_exporting()
                     except FileExistsError:
                         self._skip(slot)
+                    except Exception:
+                        if atomic:
+                            self._fail_atomic_slot(slot)
+                            slot._skipped = True
+                        raise
                 if not slot._skipped:
                     assert slot.exporter
                     try:
                         await _maybe_coroutine(slot.exporter.export_item, exported_item)
                     except Exception as e:
+                        if atomic:
+                            self._fail_atomic_slot(slot)
+                            slot._skipped = True
                         e.add_note(f"Item: {exported_item!r}")
                         raise
                 # Skipped items are counted, so that the following files of
@@ -1074,6 +1190,23 @@ class FeedExporter:
         else:
             logger.error("Unknown feed storage scheme: %(scheme)s", {"scheme": scheme})
         return False
+
+    def _check_atomic(self, uri: str, feed_options: dict[str, Any]) -> None:
+        """Raise an error if *feed_options* enable an atomic feed that cannot
+        be stored atomically."""
+        if not feed_options.get("atomic"):
+            return
+        storage = self._get_storage(uri, feed_options)
+        if not isinstance(storage, FileFeedStorage):
+            raise ValueError(
+                "The atomic feed option is only supported for local filesystem "
+                f"feeds, not for {type(storage).__name__} (feed URI: {uri})."
+            )
+        if feed_options.get("mode") != "overwrite":
+            raise ValueError(
+                "The atomic feed option requires the 'overwrite' feed mode, "
+                f"got {feed_options.get('mode')!r} (feed URI: {uri})."
+            )
 
     @staticmethod
     def _check_storage_mode(

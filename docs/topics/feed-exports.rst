@@ -171,6 +171,9 @@ specify a path (e.g. ``/tmp/export.csv``). Alternatively, you can use a
 Supported :ref:`modes <feed-mode>`: ``"append"``, ``"create"`` and
 ``"overwrite"``. If :setting:`FEED_MODE` is ``None``, ``"append"`` is used.
 
+Feeds can be stored atomically with the ``atomic`` :ref:`feed option
+<feed-options>`.
+
 .. _topics-feed-storage-ftp:
 .. _feed-storage-ftp:
 
@@ -583,6 +586,21 @@ For instance:
 
 The following is a list of the accepted keys and the setting that is used
 as a fallback value if that key is not provided for a specific feed definition:
+
+-   ``atomic``: write each batch to a temporary file, and replace the target
+    with it when the batch has been fully serialized and compressed. Defaults
+    to ``False``.
+
+    .. versionadded:: VERSION
+
+    Only supported for :ref:`local filesystem <topics-feed-storage-fs>` feeds
+    with the ``"overwrite"`` :ref:`mode <feed-mode>`; any other storage or mode
+    raises an error when the feed exporter starts.
+
+    If a batch cannot be written, the target keeps its previous content, the
+    temporary file is removed, and the remaining batches of that feed are
+    discarded, so that the stored batches never have a gap. Batches that were
+    already stored, and the feeds of other URIs, are kept.
 
 -   ``format``: the :ref:`serialization format <topics-feed-format>`.
 

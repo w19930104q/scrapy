@@ -148,7 +148,12 @@ class PostProcessingManager(IOBase):
         """
         Close the target file along with all the plugins.
         """
-        self.head_plugin.close()
+        try:
+            self.head_plugin.close()
+        finally:
+            # Mark the manager as closed even if a plugin failed, so that it
+            # is not closed again when it is garbage collected.
+            super().close()
 
     def writable(self) -> bool:
         return True
