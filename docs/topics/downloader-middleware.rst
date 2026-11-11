@@ -407,6 +407,12 @@ HttpCacheMiddleware
     You can change the HTTP cache policy with the :setting:`HTTPCACHE_POLICY`
     setting. Or you can also implement your own policy.
 
+    Responses with a ``Vary`` header are cached as separate representations,
+    one per combination of values of the listed request headers, and a
+    cached response is only returned for a request whose listed headers
+    match those of the request that produced it. Responses with
+    ``Vary: *`` are never returned from the cache.
+
     .. reqmeta:: dont_cache
 
     You can also avoid caching a response on every policy using :reqmeta:`dont_cache` meta key equals ``True``.
@@ -480,7 +486,6 @@ RFC2616 policy
     What is missing:
 
     * ``Pragma: no-cache`` support https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9.1
-    * ``Vary`` header support https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.6
     * Invalidation after updates or deletes https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.10
     * ... probably others ..
 
@@ -513,6 +518,10 @@ Filesystem storage backend (default)
 
     *   ``pickled_meta`` - the same metadata in ``meta`` but pickled for more
         efficient deserialization
+
+    Responses with a ``Vary`` header are instead stored in one subdirectory
+    per representation, next to a ``vary`` file that lists the header names
+    from the ``Vary`` header.
 
     The directory name is made from the request fingerprint (see
     ``scrapy.utils.request.fingerprint``), and one level of subdirectories is

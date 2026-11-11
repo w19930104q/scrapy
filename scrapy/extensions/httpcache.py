@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import logging
 import pickle
 from datetime import UTC
@@ -22,9 +23,10 @@ from scrapy.utils.response import response_from_dict
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from types import ModuleType
 
+    from scrapy.http.headers import Headers
     from scrapy.http.request import Request
     from scrapy.settings import BaseSettings
     from scrapy.spiders import Spider
@@ -32,6 +34,35 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_vary(headers: Headers) -> list[bytes]:
+    """Return the sorted, lowercased field names listed in the Vary header."""
+    names = set()
+    for line in headers.getlist(b"Vary"):
+        for name in line.split(b","):
+            if name := name.strip().lower():
+                names.add(name)
+    return sorted(names)
+
+
+def _vary_key(request: Request, vary_headers: list[bytes]) -> str:
+    """Return a key for the values that *request* carries for *vary_headers*.
+
+    Header names are already lowercased, and header lookup is
+    case-insensitive, so the key does not depend on name casing. A header
+    missing from the request contributes an empty value, so it only matches
+    representations stored by requests that also missed it.
+    """
+    parts = []
+    for name in vary_headers:
+        values = b",".join(value.strip() for value in request.headers.getlist(name))
+        parts.append(name + b"\x00" + values)
+    return hashlib.sha256(b"\x00".join(parts)).hexdigest()
+
+
+def _has_vary(headers: Mapping[bytes, Any]) -> bool:
+    return any(name.lower() == b"vary" for name in headers)
 
 
 def _get_scope(settings: BaseSettings, supported: tuple[str, ...]) -> str:
@@ -295,6 +326,13 @@ class DbmCacheStorage:
         self, spider: Spider, request: Request, response: Response
     ) -> None:
         key = self._fingerprinter.fingerprint(request).hex()
+        vary_headers = _parse_vary(response.headers)
+        if vary_headers:
+            self.db[f"{key}_vary"] = pickle.dumps(vary_headers, protocol=4)
+            key = f"{key}_{_vary_key(request, vary_headers)}"
+        # The newest response defines the Vary rules of the URL.
+        elif f"{key}_vary" in self.db:
+            del self.db[f"{key}_vary"]
         self.db[f"{key}_data"] = pickle.dumps(response.to_dict(), protocol=4)
         self.db[f"{key}_time"] = str(time())
 
@@ -303,6 +341,15 @@ class DbmCacheStorage:
     ) -> tuple[dict[str, Any], float] | None:
         key = self._fingerprinter.fingerprint(request).hex()
         db = self.db
+        legacy = f"{key}_vary" not in db
+        if not legacy:
+            vary_headers = cast(
+                "list[bytes]",
+                pickle.loads(db[f"{key}_vary"]),  # noqa: S301
+            )
+            if b"*" in vary_headers:
+                return None  # Vary: * responses cannot be reused
+            key = f"{key}_{_vary_key(request, vary_headers)}"
         tkey = f"{key}_time"
         if tkey not in db:
             return None  # not found
@@ -312,6 +359,10 @@ class DbmCacheStorage:
             return None  # expired
 
         data = cast("dict[str, Any]", pickle.loads(db[f"{key}_data"]))  # noqa: S301
+        if legacy and _has_vary(data.get("headers") or {}):
+            # Entries written before Vary support lack the request headers
+            # needed to tell whether they match this request.
+            return None
         return data, ts
 
 
@@ -342,18 +393,28 @@ class FilesystemCacheStorage:
 
     def retrieve_response(self, spider: Spider, request: Request) -> Response | None:
         """Return response if present in cache, or None otherwise."""
-        metadata = self._read_meta(spider, request)
+        rpath = Path(self._get_request_path(spider, request))
+        vary_headers = self._read_vary(rpath)
+        if vary_headers is not None:
+            if b"*" in vary_headers:
+                return None  # Vary: * responses cannot be reused
+            rpath = rpath / f"v_{_vary_key(request, vary_headers)}"
+        metadata = self._read_meta(rpath)
         if metadata is None:
             return None  # not cached
-        rpath = Path(self._get_request_path(spider, request))
         with self._open(rpath / "response_body", "rb") as f:
             body = f.read()
         with self._open(rpath / "response_headers", "rb") as f:
             rawheaders = f.read()
+        headers = headers_raw_to_dict(rawheaders)
+        if vary_headers is None and _has_vary(headers):
+            # Entries written before Vary support lack the request headers
+            # needed to tell whether they match this request.
+            return None
         data = {
             "url": metadata["response_url"],
             "status": metadata["status"],
-            "headers": headers_raw_to_dict(rawheaders),
+            "headers": headers,
             "body": body,
         }
         datapath = rpath / "response_data"
@@ -370,6 +431,18 @@ class FilesystemCacheStorage:
         rpath = Path(self._get_request_path(spider, request))
         if not rpath.exists():
             rpath.mkdir(parents=True)
+        vary_headers = _parse_vary(response.headers)
+        if vary_headers:
+            with self._open(rpath / "vary", "wb") as f:
+                pickle.dump(vary_headers, f, protocol=4)
+            rpath = rpath / f"v_{_vary_key(request, vary_headers)}"
+            if not rpath.exists():
+                rpath.mkdir()
+        else:
+            # The newest response defines the Vary rules of the URL.
+            vary_path = rpath / "vary"
+            if vary_path.exists():
+                vary_path.unlink()
         metadata = {
             "url": request.url,
             "method": request.method,
@@ -411,8 +484,14 @@ class FilesystemCacheStorage:
             return quote(urlparse_cached(request).hostname or "_", safe="")
         return ""
 
-    def _read_meta(self, spider: Spider, request: Request) -> dict[str, Any] | None:
-        rpath = Path(self._get_request_path(spider, request))
+    def _read_vary(self, rpath: Path) -> list[bytes] | None:
+        varypath = rpath / "vary"
+        if not varypath.exists():
+            return None  # no Vary rules recorded for the URL
+        with self._open(varypath, "rb") as f:
+            return cast("list[bytes]", pickle.load(f))  # noqa: S301
+
+    def _read_meta(self, rpath: Path) -> dict[str, Any] | None:
         metapath = rpath / "pickled_meta"
         if not metapath.exists():
             return None  # not found
