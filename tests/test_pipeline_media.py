@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 import pytest
-from twisted.internet.defer import succeed
+from twisted.internet.defer import CancelledError, Deferred, succeed
 from twisted.python.failure import Failure
 
 from scrapy import signals
@@ -17,7 +18,12 @@ from scrapy.pipelines.media import (
     MediaPipeline,
     _MediaRequestFiltered,
 )
-from scrapy.utils.defer import _process_pending_io
+from scrapy.utils.asyncio import sleep
+from scrapy.utils.defer import (
+    _process_pending_io,
+    deferred_from_coro,
+    maybe_deferred_to_future,
+)
 from scrapy.utils.log import failure_to_exc_info
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.signal import disconnect_all
@@ -28,8 +34,6 @@ from tests.utils.media_pipelines import mocked_download_func
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
-
-    from twisted.internet.defer import Deferred
 
     from scrapy.crawler import Crawler
 
@@ -646,3 +650,377 @@ class TestMediaFailedFailure(TestBaseMediaPipeline):
             "request_errback",
             "item_completed",
         ]
+
+
+class _ControlledDownload:
+    """A stand-in for ``engine.download_async`` whose completion and
+    cancellation are driven by the test through
+    :class:`~twisted.internet.defer.Deferred` objects, so the behavior is
+    identical with either reactor implementation.
+
+    Each call parks on a pending Deferred. When it is cancelled the coroutine
+    either propagates the cancellation or, when *survive_cancellation* is set,
+    moves onto a second Deferred that the test can resolve afterwards, modeling
+    a download whose result arrives after the cancellation.
+    """
+
+    def __init__(self, *, survive_cancellation: bool = False) -> None:
+        self.pending: list[Deferred[Response]] = []
+        self.cancelled: list[Deferred[Response]] = []
+        # Deferreds awaited by coroutines that survived their cancellation.
+        self.survivors: list[Deferred[Response]] = []
+        self.calls = 0
+        self._survive = survive_cancellation
+
+    async def __call__(self, request: Request) -> Response:
+        self.calls += 1
+        first: Deferred[Response] = Deferred()
+        self.pending.append(first)
+        try:
+            return await maybe_deferred_to_future(first)
+        except (CancelledError, asyncio.CancelledError):
+            self.cancelled.append(first)
+            if not self._survive:
+                raise
+            late: Deferred[Response] = Deferred()
+            self.survivors.append(late)
+            return await maybe_deferred_to_future(late)
+
+
+class _CancellationPipeline(MockedMediaPipeline):
+    """Pipeline whose item_completed records that it ran, so a cancelled item
+    can be distinguished from one that completed normally."""
+
+    def __init__(self, *args: Any, crawler: Crawler, **kwargs: Any) -> None:
+        super().__init__(*args, crawler=crawler, **kwargs)
+        self.comp_items: list[Any] = []
+
+    def item_completed(
+        self,
+        results: list[FileInfoOrError],
+        item: Any,
+        info: MediaPipeline.SpiderInfo,
+    ) -> Any:
+        self.comp_items.append(item)
+        return super().item_completed(results, item, info)
+
+
+def _cancellation_request(url: str = "http://example.com/file") -> Request:
+    return Request(url)
+
+
+@pytest.mark.only_asyncio
+class TestMediaCancellation:
+    """Cancelling the Deferred returned by process_item() must only end that
+    item; other items sharing the same media download keep waiting and get
+    their result, independently of which item started the download."""
+
+    def setup_method(self) -> None:
+        crawler = get_crawler(DefaultSpider)
+        crawler.spider = crawler._create_spider()
+        self.download = _ControlledDownload()
+        crawler.engine = MagicMock(download_async=self.download)
+        self.pipe = build_from_crawler(_CancellationPipeline, crawler)
+        self.pipe.open_spider()
+        self.info = self.pipe.spiderinfo
+        self.fingerprint = crawler.request_fingerprinter.fingerprint
+
+    def teardown_method(self) -> None:
+        for name, signal in vars(signals).items():
+            if not name.startswith("_"):
+                disconnect_all(signal)
+
+    def _start_item(self, *requests: Request) -> Deferred[Any]:
+        # A Deferred keeps the same cancellation semantics on every reactor.
+        return deferred_from_coro(self.pipe.process_item({"requests": list(requests)}))
+
+    async def _flush(self) -> None:
+        # Let the download coroutine register its Deferred and the waiters
+        # park on theirs.
+        for _ in range(5):
+            await sleep(0)
+
+    async def _assert_cancelled(self, deferred: Deferred[Any]) -> None:
+        # The concrete CancelledError class depends on the reactor.
+        with pytest.raises((CancelledError, asyncio.CancelledError)):
+            await maybe_deferred_to_future(deferred)
+
+    @coroutine_test
+    async def test_cancel_first_waiter_keeps_shared_download(self) -> None:
+        req1 = _cancellation_request()
+        req2 = Request(req1.url)
+        fp = self.fingerprint(req1)
+
+        first = self._start_item(req1)
+        await self._flush()
+        second = self._start_item(req2)
+        await self._flush()
+        assert fp in self.info.downloading
+        assert len(self.info.waiting[fp]) == 2
+
+        first.cancel()
+        await self._assert_cancelled(first)
+        # The download stays alive for the second item; only its waiter
+        # remains registered.
+        assert fp in self.info.downloading
+        assert len(self.info.waiting[fp]) == 1
+        assert not self.download.cancelled
+
+        self.download.pending[0].callback(Response(req1.url))
+        item = await maybe_deferred_to_future(second)
+        assert item["results"] == [(True, {})]
+        assert fp in self.info.downloaded
+        assert self.pipe.comp_items == [item]
+
+    @coroutine_test
+    async def test_cancel_second_waiter_keeps_shared_download(self) -> None:
+        # Initiation order must not matter: cancelling a waiter that joined a
+        # running download leaves the originating item intact.
+        req1 = _cancellation_request()
+        req2 = Request(req1.url)
+        fp = self.fingerprint(req1)
+
+        first = self._start_item(req1)
+        await self._flush()
+        second = self._start_item(req2)
+        await self._flush()
+
+        second.cancel()
+        await self._assert_cancelled(second)
+        assert fp in self.info.downloading
+        assert len(self.info.waiting[fp]) == 1
+        assert not self.download.cancelled
+
+        self.download.pending[0].callback(Response(req1.url))
+        item = await maybe_deferred_to_future(first)
+        assert item["results"] == [(True, {})]
+
+    @coroutine_test
+    async def test_cancel_only_waiter_cancels_download_and_frees_state(
+        self,
+    ) -> None:
+        req = _cancellation_request()
+        fp = self.fingerprint(req)
+        task = self._start_item(req)
+        await self._flush()
+        assert self.download.pending
+
+        task.cancel()
+        await self._assert_cancelled(task)
+        await self._flush()
+
+        assert self.download.cancelled
+        assert fp not in self.info.downloading
+        assert not self.info.download_states
+        assert not self.info.waiting
+        # A cancelled download is never cached as a failure.
+        assert fp not in self.info.downloaded
+        assert self.pipe.comp_items == []
+
+    @coroutine_test
+    async def test_retry_after_full_cancellation_is_clean(self) -> None:
+        # Once every waiter was cancelled, a new item for the same URL starts
+        # a fresh download instead of inheriting the cancelled state.
+        req = _cancellation_request()
+        fp = self.fingerprint(req)
+        task = self._start_item(req)
+        await self._flush()
+        task.cancel()
+        await self._flush()
+        assert self.download.calls == 1
+
+        retry = self._start_item(Request(req.url))
+        await self._flush()
+        assert self.download.calls == 2
+        assert fp in self.info.downloading
+        self.download.pending[1].callback(Response(req.url))
+        item = await maybe_deferred_to_future(retry)
+        assert item["results"] == [(True, {})]
+
+    @coroutine_test
+    async def test_late_result_does_not_poison_new_download(self) -> None:
+        # A download whose last waiter was cancelled is detached from the
+        # state. A result arriving late must neither be cached nor reach the
+        # waiters of a newer download for the same fingerprint.
+        self.download = _ControlledDownload(survive_cancellation=True)
+        self.pipe.crawler.engine = MagicMock(download_async=self.download)
+
+        req = _cancellation_request()
+        fp = self.fingerprint(req)
+        task = self._start_item(req)
+        await self._flush()
+        stale_deferred = self.download.pending[0]
+        task.cancel()
+        await self._flush()
+        # The cancelled coroutine stays alive, waiting on a new Deferred.
+        assert len(self.download.survivors) == 1
+        survivor = self.download.survivors[0]
+
+        retry = self._start_item(Request(req.url))
+        await self._flush()
+        # The retry owns a fresh download, unrelated to the surviving one.
+        assert self.download.pending[1] is not stale_deferred
+        assert self.download.pending[1] is not survivor
+        assert fp in self.info.downloading
+
+        # The surviving download reports a failure too late.
+        survivor.errback(Failure(RuntimeError("late")))
+        await self._flush()
+        assert fp not in self.info.downloaded
+
+        self.download.pending[1].callback(Response(req.url))
+        item = await maybe_deferred_to_future(retry)
+        assert item["results"] == [(True, {})]
+
+    @coroutine_test
+    async def test_duplicate_urls_in_one_item_cancel_together(self) -> None:
+        # One item may request the same URL more than once. Cancelling its
+        # process_item() reaches every one of its waiters, while a different
+        # item sharing the download survives.
+        req1 = _cancellation_request()
+        duplicated = Request(req1.url)
+        other = Request(req1.url)
+        fp = self.fingerprint(req1)
+
+        duplicated_item = self._start_item(req1, duplicated)
+        await self._flush()
+        other_item = self._start_item(other)
+        await self._flush()
+        # Two waiters belong to the duplicated item, one to the other item.
+        assert len(self.info.waiting[fp]) == 3
+
+        duplicated_item.cancel()
+        await self._assert_cancelled(duplicated_item)
+        assert fp in self.info.downloading
+        assert len(self.info.waiting[fp]) == 1
+        assert not self.download.cancelled
+
+        self.download.pending[0].callback(Response(req1.url))
+        item = await maybe_deferred_to_future(other_item)
+        assert item["results"] == [(True, {})]
+
+    @coroutine_test
+    async def test_cancelled_request_skips_errback(self) -> None:
+        calls: list[str] = []
+
+        def errback(failure: Failure) -> FileInfo:
+            calls.append("errback")
+            return cast("FileInfo", {"recovered": True})
+
+        req = Request("http://example.com/file", errback=errback)
+        task = self._start_item(req)
+        await self._flush()
+        task.cancel()
+        await self._assert_cancelled(task)
+        assert calls == []
+
+    @coroutine_test
+    async def test_uncancelled_failure_still_calls_errback_and_caches(
+        self,
+    ) -> None:
+        # The ordinary failure path and its errback behavior are unchanged.
+        exc = RuntimeError("boom")
+        req = Request(
+            "http://example.com/file",
+            errback=lambda failure: cast("FileInfo", {"recovered": failure.value}),
+        )
+        task = self._start_item(req)
+        await self._flush()
+        self.download.pending[0].errback(Failure(exc))
+        item = await maybe_deferred_to_future(task)
+        assert item["results"] == [(True, {"recovered": exc})]
+        assert self.fingerprint(req) in self.info.downloaded
+
+    @coroutine_test
+    async def test_distinct_crawlers_do_not_share_state(self) -> None:
+        other_crawler = get_crawler(DefaultSpider)
+        other_crawler.spider = other_crawler._create_spider()
+        other_download = _ControlledDownload()
+        other_crawler.engine = MagicMock(download_async=other_download)
+        other_pipe = build_from_crawler(_CancellationPipeline, other_crawler)
+        other_pipe.open_spider()
+
+        req = _cancellation_request()
+        task = self._start_item(req)
+        await self._flush()
+        task.cancel()
+        await self._flush()
+
+        # The other crawler owns a separate SpiderInfo and is unaffected.
+        other_info = other_pipe.spiderinfo
+        assert other_info is not self.info
+        assert not other_info.download_states
+        other_item = deferred_from_coro(
+            other_pipe.process_item({"requests": [Request(req.url)]})
+        )
+        await self._flush()
+        assert other_download.calls == 1
+        other_download.pending[0].callback(Response(req.url))
+        result = await maybe_deferred_to_future(other_item)
+        assert result["results"] == [(True, {})]
+
+
+@pytest.mark.only_not_asyncio
+class TestMediaCancellationNonAsyncio:
+    """Cancellation behavior for the deprecated non-asyncio reactor path,
+    where twisted's CancelledError is an Exception and DeferredList does not
+    propagate cancellations on its own."""
+
+    def setup_method(self) -> None:
+        crawler = get_crawler(DefaultSpider)
+        crawler.spider = crawler._create_spider()
+        self.download = _ControlledDownload()
+        crawler.engine = MagicMock(download_async=self.download)
+        self.pipe = build_from_crawler(_CancellationPipeline, crawler)
+        self.pipe.open_spider()
+        self.info = self.pipe.spiderinfo
+        self.fingerprint = crawler.request_fingerprinter.fingerprint
+
+    def teardown_method(self) -> None:
+        for name, signal in vars(signals).items():
+            if not name.startswith("_"):
+                disconnect_all(signal)
+
+    async def _flush(self) -> None:
+        for _ in range(5):
+            await sleep(0)
+
+    @coroutine_test
+    async def test_process_item_cancel_ends_with_cancelled_error(self) -> None:
+        req = _cancellation_request()
+        fp = self.fingerprint(req)
+        item_deferred = deferred_from_coro(self.pipe.process_item({"requests": [req]}))
+        await self._flush()
+
+        item_deferred.cancel()
+        with pytest.raises(CancelledError):
+            await item_deferred
+
+        await self._flush()
+        # The shared download was cancelled and no state or failure leaked.
+        assert self.download.cancelled
+        assert fp not in self.info.downloading
+        assert not self.info.download_states
+        assert fp not in self.info.downloaded
+        assert self.pipe.comp_items == []
+
+    @coroutine_test
+    async def test_shared_download_survives_first_cancellation(self) -> None:
+        req1 = _cancellation_request()
+        req2 = Request(req1.url)
+        fp = self.fingerprint(req1)
+
+        first = deferred_from_coro(self.pipe.process_item({"requests": [req1]}))
+        await self._flush()
+        second = deferred_from_coro(self.pipe.process_item({"requests": [req2]}))
+        await self._flush()
+
+        first.cancel()
+        with pytest.raises(CancelledError):
+            await first
+        assert fp in self.info.downloading
+        assert not self.download.cancelled
+
+        self.download.pending[0].callback(Response(req1.url))
+        item = await maybe_deferred_to_future(second)
+        assert item["results"] == [(True, {})]

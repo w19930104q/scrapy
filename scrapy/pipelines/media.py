@@ -9,7 +9,7 @@ from collections import OrderedDict, defaultdict
 from traceback import clear_frames
 from typing import TYPE_CHECKING, Any, Literal, Self, TypeAlias, TypedDict, cast
 
-from twisted.internet.defer import Deferred, DeferredList
+from twisted.internet.defer import CancelledError, Deferred, DeferredList
 from twisted.python.failure import Failure
 
 from scrapy.exceptions import ScrapyDeprecationWarning
@@ -71,6 +71,38 @@ def _media_request_filtered(failure: Failure) -> bool:
     return isinstance(failure.value, _MediaRequestFiltered)
 
 
+class _Waiter(TypedDict):
+    deferred: Deferred[FileInfo]
+    errback: Callable[[Failure], FileInfo] | None
+    active: bool
+
+
+class _DownloadState:
+    """A media download that is in progress and may be shared by several items.
+
+    Every item whose request has the same fingerprint waits on its own
+    :class:`~twisted.internet.defer.Deferred` in *waiting*. The first such item
+    runs the download through *deferred*; cancelling an individual item only
+    deactivates its own waiters, while cancelling the last active waiter
+    cancels *deferred* and thus the shared download itself.
+    """
+
+    def __init__(
+        self,
+        deferred: Deferred[FileInfo | Failure],
+        fp: bytes,
+        info: MediaPipeline.SpiderInfo,
+    ) -> None:
+        self.deferred = deferred
+        self.fp = fp
+        self.info = info
+        self.waiting: list[_Waiter] = []
+
+    @property
+    def active_waiters(self) -> list[_Waiter]:
+        return [waiter for waiter in self.waiting if waiter["active"]]
+
+
 class MediaPipeline(ABC):
     LOG_FAILED_RESULTS: bool = True
 
@@ -79,9 +111,22 @@ class MediaPipeline(ABC):
             self.spider: Spider = spider
             self.downloading: set[bytes] = set()
             self.downloaded: OrderedDict[bytes, FileInfo | Failure] = OrderedDict()
-            self.waiting: defaultdict[bytes, list[Deferred[FileInfo]]] = defaultdict(
-                list
-            )
+            # One entry per fingerprint with a download in progress. The
+            # ``downloading`` set keeps the same fingerprints for backwards
+            # compatibility of the public state inspection.
+            self.download_states: dict[bytes, _DownloadState] = {}
+
+        @property
+        def waiting(self) -> defaultdict[bytes, list[Deferred[FileInfo]]]:
+            # Backwards-compatible view over the per-download waiter lists:
+            # only Deferreds of items still waiting for a result, grouped by
+            # fingerprint, in registration order.
+            grouped: defaultdict[bytes, list[Deferred[FileInfo]]] = defaultdict(list)
+            for fp, state in self.download_states.items():
+                grouped[fp] = [
+                    waiter["deferred"] for waiter in state.waiting if waiter["active"]
+                ]
+            return grouped
 
     def __init__(
         self,
@@ -163,12 +208,29 @@ class MediaPipeline(ABC):
                     else:
                         results.append((True, res))
             else:
+                deferreds = [deferred_from_coro(coro) for coro in coros]
+
+                def _consume_cancellation(
+                    failure: Failure,
+                ) -> Failure:
+                    # DeferredList still receives this failure, but consuming
+                    # it here keeps the cancelled Deferred from reporting an
+                    # unhandled error when process_item() re-raises it.
+                    failure.trap(CancelledError)
+                    return failure
+
+                for deferred in deferreds:
+                    deferred.addErrback(_consume_cancellation)
                 results = await cast(
                     "Deferred[list[FileInfoOrError]]",
-                    DeferredList(
-                        (deferred_from_coro(coro) for coro in coros), consumeErrors=True
-                    ),
+                    DeferredList(deferreds, consumeErrors=True),
                 )
+                # DeferredList turns a cancellation into an ordinary result,
+                # but a cancelled item must end with CancelledError before
+                # item_completed() rather than being processed.
+                for _, value in results:
+                    if isinstance(value, Failure) and value.check(CancelledError):
+                        value.raiseException()
         return await ensure_awaitable(self.item_completed(results, item, info))
 
     async def _process_request(
@@ -191,37 +253,88 @@ class MediaPipeline(ABC):
                 cached_result.raiseException()
             return cached_result
 
-        # Otherwise, wait for result
-        wad: Deferred[FileInfo] = Deferred()
-        if eb:
-            wad.addErrback(eb)
-        info.waiting[fp].append(wad)
+        # Otherwise, wait for result. Each item owns its own Deferred, so
+        # cancelling one item only deactivates its own waiters without
+        # touching the items sharing the download. The request errback is not
+        # attached to the Deferred: a cancelled item must fail with
+        # CancelledError instead of letting the errback recover it.
+        wad: Deferred[FileInfo] = Deferred(lambda d: self._on_waiter_canceled(d, info))
+        waiter: _Waiter = {"deferred": wad, "errback": eb, "active": True}
 
-        # Check if request is downloading right now to avoid doing it twice
-        if fp in info.downloading:
-            return await maybe_deferred_to_future(wad)
+        state = info.download_states.get(fp)
+        if state is None:
+            # Start the download, checking the media_to_download hook first.
+            info.downloading.add(fp)
+            state = _DownloadState(
+                deferred_from_coro(self._download_media(request, info, item)),
+                fp,
+                info,
+            )
+            info.download_states[fp] = state
+            # A late download result is ignored unless it comes from the
+            # download still registered for this fingerprint.
+            state.deferred.addBoth(
+                lambda result: self._download_finished(result, state, info)
+            )
+        state.waiting.append(waiter)
+        return await maybe_deferred_to_future(wad)  # it must return wad at last
 
-        # Download request checking media_to_download hook output first
-        info.downloading.add(fp)
-        await _process_pending_io()
-        result: FileInfo | Failure
+    async def _download_media(
+        self, request: Request, info: SpiderInfo, item: Any
+    ) -> FileInfo | Failure:
         try:
             file_info: FileInfo | None = await ensure_awaitable(
                 self.media_to_download(request, info, item=item)
             )
             if file_info:
                 # got a result without downloading
-                result = file_info
-            else:
-                # download the result
-                result = await self._check_media_to_download(request, info, item=item)
+                return file_info
+            # download the result
+            return await self._check_media_to_download(request, info, item=item)
+        except (CancelledError, asyncio.CancelledError):
+            # A cancelled download is not a media failure: propagate it so the
+            # item ends with CancelledError instead of reaching
+            # media_failed() or item_completed().
+            raise
         except Exception:
-            result = Failure()
-            if not _media_request_filtered(result):
-                logger.exception(result)
-        await _process_pending_io()
-        self._cache_result_and_execute_waiters(result, fp, info)
-        return await maybe_deferred_to_future(wad)  # it must return wad at last
+            failure = Failure()
+            if not _media_request_filtered(failure):
+                logger.exception(failure)
+            return failure
+
+    def _download_finished(
+        self, result: FileInfo | Failure, state: _DownloadState, info: SpiderInfo
+    ) -> None:
+        # The download may have been cancelled with its last waiter and a new
+        # download for the same fingerprint may have started since; only the
+        # download still registered owns the state. A cancelled download is
+        # always detached beforehand, so its late result is ignored here.
+        if info.download_states.get(state.fp) is not state:
+            return
+        info.downloading.discard(state.fp)
+        del info.download_states[state.fp]
+        self._cache_result_and_execute_waiters(result, state)
+
+    def _on_waiter_canceled(self, wad: Deferred[FileInfo], info: SpiderInfo) -> None:
+        # Cancelling an item deactivates only its own waiters; one item can
+        # hold several waiters for the same fingerprint (duplicate URLs), and
+        # cancelling its task reaches all of them in a chain. The shared
+        # download is cancelled only once no active waiter remains, leaving the
+        # other items untouched. item_completed() is never called for a
+        # cancelled item.
+        for state in list(info.download_states.values()):
+            for waiter in state.waiting:
+                if waiter["deferred"] is not wad or not waiter["active"]:
+                    continue
+                waiter["active"] = False
+                if (
+                    not state.active_waiters
+                    and info.download_states.get(state.fp) is state
+                ):
+                    info.downloading.discard(state.fp)
+                    del info.download_states[state.fp]
+                    state.deferred.cancel()
+                return
 
     def _modify_media_request(self, request: Request) -> None:
         if self.handle_httpstatus_list:
@@ -250,7 +363,7 @@ class MediaPipeline(ABC):
                 failure.raiseException()
 
     def _cache_result_and_execute_waiters(
-        self, result: FileInfo | Failure, fp: bytes, info: SpiderInfo
+        self, result: FileInfo | Failure, state: _DownloadState
     ) -> None:
         if isinstance(result, Failure):
             # minimize cached information for failure
@@ -263,13 +376,26 @@ class MediaPipeline(ABC):
             if TWISTED_FAILURE_HAS_STACK:
                 result.stack.clear()
 
-        info.downloading.remove(fp)
-        info.downloaded[fp] = result  # cache result
+        info = state.info
+        info.downloaded[state.fp] = result  # cache result
         if 0 <= self._cache_size < len(info.downloaded):
             info.downloaded.popitem(last=False)
-        for wad in info.waiting.pop(fp):
+        for waiter in state.waiting:
+            if not waiter["active"]:
+                # Its item was cancelled while the download was in flight.
+                continue
+            wad = waiter["deferred"]
             if isinstance(result, Failure):
-                wad.errback(result)
+                errback = waiter["errback"]
+                if errback:
+                    # Let the request errback handle the failure; if it
+                    # returns a value, the item gets a successful result.
+                    try:
+                        wad.callback(errback(result))
+                    except Exception:
+                        wad.errback(Failure())
+                else:
+                    wad.errback(result)
             else:
                 wad.callback(result)
 
